@@ -1,7 +1,1 @@
-__pycache__/
-*.pyc
-build/
-dist/
-*.spec
-.venv/
-*.egg-info/
+IyBCdWlsZCBvdXRwdXQKZGlzdC8KYnVpbGQvCiouc3BlYwoKIyBQeXRob24KX19weWNhY2hlX18vCioucHljCioucHlvCgojIElERQoudnNjb2RlLwouaWRlYS8KCiMgT1MKLkRTX1N0b3JlClRodW1icy5kYgoKIyBUZXN0IGZpbGVzCnRlc3RfKi5weQoKIyBDb25maWcgKHVzZXIgZGF0YSkKY29uZmlnLwo=
