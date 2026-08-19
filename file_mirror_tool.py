@@ -10,6 +10,7 @@ import os
 import sys
 import json
 import re
+import uuid
 import ctypes
 import webbrowser
 import urllib.request
@@ -23,13 +24,14 @@ import traceback
 
 # ── 常量 ─────────────────────────────────────────────────────────────────
 
-VERSION = "v1.3"
-# 日志和配置目录：优先使用 exe 所在的 config 文件夹，兼容开发模式
+VERSION = "v1.4"
+# 数据目录：优先使用 exe 所在的 config 文件夹，兼容开发模式
 if getattr(sys, 'frozen', False):
     _BASE_DIR = Path(sys.executable).parent / "config"
 else:
     _BASE_DIR = Path(__file__).parent
-LOG_DIR = _BASE_DIR / "logs"
+SCHEME_FILE = _BASE_DIR / "schemes.json"        # 所有方案合并到一个文件
+LOG_FILE = _BASE_DIR / "sync_log.txt"            # 所有日志合并到一个文件
 CONFIG_FILE = _BASE_DIR / "file_mirror_config.json"
 PROGRESS_FILE = _BASE_DIR / "sync_progress.json"
 GITHUB_API = "https://api.github.com/repos/awenwa/FileMirrorTool/releases/latest"
@@ -86,19 +88,42 @@ def save_config(cfg):
         print(f"保存配置失败: {e}")
 
 
-# ── 方案目录工具 ────────────────────────────────────────────────────────────
+# ── 方案存储（合并到单一文件） ──────────────────────────────────────────────
 
-def get_scheme_dir():
-    if getattr(sys, 'frozen', False):
-        base_dir = Path(sys.executable).parent
-    else:
-        base_dir = Path(__file__).parent
-    scheme_dir = base_dir / "config"
-    scheme_dir.mkdir(parents=True, exist_ok=True)
-    return scheme_dir
+def load_schemes():
+    """从单一文件加载所有方案，返回 list[dict]"""
+    if not SCHEME_FILE.exists():
+        return []
+    try:
+        with open(SCHEME_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        schemes = data.get("schemes", []) if isinstance(data, dict) else (data or [])
+        return schemes
+    except Exception as e:
+        print(f"加载方案失败: {e}")
+        return []
+
+
+def save_schemes(schemes):
+    """保存所有方案到单一文件"""
+    try:
+        SCHEME_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(SCHEME_FILE, "w", encoding="utf-8") as f:
+            json.dump({"schemes": schemes}, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"保存方案失败: {e}")
+
+
+def find_scheme(scheme_id):
+    """按 id 查找方案"""
+    for s in load_schemes():
+        if s.get("id") == scheme_id:
+            return s
+    return None
 
 
 def load_scheme_file(filepath):
+    """兼容旧调用（按文件路径加载，已弃用）"""
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -133,6 +158,7 @@ class FileMirrorSync:
             "skipped": 0,
             "errors": 0,
             "replaced": 0,
+            "cancelled": 0,
         }
         self.processed_files = set()  # 已处理的文件（相对路径）
         self.total_files = 0
@@ -257,8 +283,22 @@ class FileMirrorSync:
                     self.stats["replaced"] += 1
                 except Exception:
                     pass
-            import shutil
-            shutil.copy2(str(src_file), str(dst_file))
+            # 分块复制，每写完一块检查一次取消标志，保证大文件也能及时响应取消
+            BUF = 8 * 1024 * 1024  # 8MB
+            with open(src_file, "rb") as fin, open(dst_file, "wb") as fout:
+                while True:
+                    if self._should_cancel():
+                        # 取消：删除未完成的目标文件
+                        try:
+                            fout.close()
+                            os.remove(str(dst_file))
+                        except Exception:
+                            pass
+                        return "cancelled"
+                    chunk = fin.read(BUF)
+                    if not chunk:
+                        break
+                    fout.write(chunk)
             return "copy"
         except Exception:
             return "error"
@@ -280,6 +320,7 @@ class FileMirrorSync:
         if result == "symlink": self.stats["symlinks_created"] += 1
         elif result == "copy": self.stats["copies_created"] += 1
         elif result == "skipped": self.stats["skipped"] += 1
+        elif result == "cancelled": self.stats["cancelled"] = self.stats.get("cancelled", 0) + 1
         else: self.stats["errors"] += 1
 
     def _cleanup(self, src_files_set):
@@ -332,6 +373,9 @@ class FileMirrorSync:
             total = 0
             scanned_dirs = 0
             for _root, _dirs, files in os.walk(self.src):
+                if self._should_cancel():
+                    self._log("用户取消操作（扫描阶段）", "WARN")
+                    return False
                 total += len(files)
                 scanned_dirs += 1
                 if scanned_dirs % 50 == 0:
@@ -463,7 +507,7 @@ class FileMirrorApp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title(f"文件镜像同步工具 {VERSION}")
+        self.root.title("文件镜像同步工具")
         self.root.geometry("1050x720")
         self.root.minsize(900, 600)
         self._center_window()
@@ -473,8 +517,14 @@ class FileMirrorApp:
         self.sync_obj = None
         self.cancelled_flag = False
         self.is_admin = is_admin()
-        self.current_scheme_path = None
+        self.current_scheme_id = None
+        self._last_saved_log_idx = "1.0"
         self.font_size = self.cfg.get("font_size", 10)  # 字体大小
+        self._migrate_old_schemes()  # 兼容旧版：把分散的方案文件合并进 schemes.json
+        
+        # 初始化 Mix 相关属性（避免 _on_sync_type_change 访问时报错）
+        self.filter_frame = None
+        self._mix_diagram_canvas = None
 
         self._create_ui()
 
@@ -558,6 +608,7 @@ class FileMirrorApp:
         self.scheme_menu.add_command(label="修改执行时间", command=self._edit_scheme_runtime)
         self.scheme_menu.add_separator()
         self.scheme_menu.add_command(label="删除方案", command=self._delete_scheme)
+        self.scheme_tree.bind("<Double-1>", self._load_scheme_from_list)  # 双击载入方案
         self.scheme_tree.bind("<Button-3>", self._show_scheme_menu)
         self.scheme_tree.bind("<<TreeviewSelect>>", self._on_scheme_select)
 
@@ -569,6 +620,13 @@ class FileMirrorApp:
 
         self._build_right_panel(right_fr)
         self._refresh_scheme_list()
+        # 从配置中恢复最后选中的方案（如果有）
+        last_sid = self.cfg.get("last_scheme_id")
+        if last_sid:
+            self.current_scheme_id = last_sid
+            children = self.scheme_tree.get_children()
+            if last_sid in children:
+                self.scheme_tree.selection_set(last_sid)
         
         # 加载上次日志
         self._load_last_log()
@@ -604,7 +662,7 @@ class FileMirrorApp:
         folder_fr.columnconfigure(1, weight=0)  # 互换按钮列
         folder_fr.columnconfigure(2, weight=1)
 
-        left_fr = ttk.LabelFrame(folder_fr, text="左侧文件夹：", padding="5")
+        left_fr = ttk.LabelFrame(folder_fr, text="源文件夹：", padding="5")
         left_fr.grid(row=0, column=0, sticky="we", padx=(0, 5))
         left_fr.columnconfigure(0, weight=1)
         self.src_var = tk.StringVar(value=self.cfg.get("last_src", ""))
@@ -617,102 +675,75 @@ class FileMirrorApp:
         swap_btn.bind("<Enter>", lambda e: swap_btn.config(text="⇄ 互换"))
         swap_btn.bind("<Leave>", lambda e: swap_btn.config(text="⇄"))
 
-        right_fr = ttk.LabelFrame(folder_fr, text="右侧文件夹：", padding="5")
+        right_fr = ttk.LabelFrame(folder_fr, text="目标文件夹：", padding="5")
         right_fr.grid(row=0, column=2, sticky="we")
         right_fr.columnconfigure(0, weight=1)
         self.dst_var = tk.StringVar(value=self.cfg.get("last_dst", ""))
         ttk.Entry(right_fr, textvariable=self.dst_var, font=self._font()).grid(row=0, column=0, sticky="we", padx=(0, 5))
         ttk.Button(right_fr, text="浏览...", command=self._browse_dst, width=8).grid(row=0, column=1)
 
-        # 同步方式
+        # 同步方式（卡片式设计）
         type_fr = ttk.LabelFrame(parent, text="同步方式", padding="8")
         type_fr.grid(row=1, column=0, sticky="we", pady=(0, 6))
+        type_fr.columnconfigure(0, weight=1)
+        type_fr.columnconfigure(1, weight=1)
+        type_fr.columnconfigure(2, weight=1)
 
         self.sync_type_var = tk.StringVar()
         last_st = self.cfg.get("sync_type", "symlink")
 
-        opt1 = ttk.Frame(type_fr)
-        opt1.pack(fill=tk.X, pady=2)
-        rb1 = ttk.Radiobutton(opt1, text="🔗 Link：右侧链接左侧",
-                          value="symlink", variable=self.sync_type_var, command=self._on_sync_type_change)
-        rb1.pack(side=tk.LEFT)
-        opt1.bind('<Button-1>', lambda e: (self.sync_type_var.set("symlink"), self._on_sync_type_change()))
-        if last_st == "symlink": self.sync_type_var.set("symlink")
+        # 三个选项卡片
+        self._card_frames = {}  # 存储卡片引用，用于高亮选中状态
+        
+        # Link 卡片：三条虚线（代表软连接）
+        self._card_frames["symlink"] = self._create_sync_card(
+            type_fr, 0, "symlink", "🔗", "Link（链接）",
+            "目标文件夹生成源文件夹的软链接",
+            ["dashed", "dashed", "dashed"]
+        )
+        
+        # Mix 卡片：上中下三条线（虚-实-虚），选中后被过滤条件替换
+        self._card_frames["mix"] = self._create_sync_card(
+            type_fr, 1, "mix", "⚡", "Mix（混合）",
+            "符合条件的文件复制，其他生成软链接",
+            ["dashed", "solid", "dashed"]
+        )
+        
+        # Mirror 卡片：三条实线（代表复制）
+        self._card_frames["mirror"] = self._create_sync_card(
+            type_fr, 2, "mirror", "💾", "Mirror（镜像）",
+            "将源文件夹复制到目标文件夹",
+            ["solid", "solid", "solid"]
+        )
 
-        opt2 = ttk.Frame(type_fr)
-        opt2.pack(fill=tk.X, pady=2)
-        rb2 = ttk.Radiobutton(opt2, text="💾 Mirror：右侧镜像左侧",
-                          value="mirror", variable=self.sync_type_var, command=self._on_sync_type_change)
-        rb2.pack(side=tk.LEFT)
-        opt2.bind('<Button-1>', lambda e: (self.sync_type_var.set("mirror"), self._on_sync_type_change()))
-        if last_st == "mirror": self.sync_type_var.set("mirror")
-
-        opt3 = ttk.Frame(type_fr)
-        opt3.pack(fill=tk.X, pady=2)
-        rb3 = ttk.Radiobutton(opt3, text="⚡ Mix：混合同步",
-                          value="mix", variable=self.sync_type_var, command=self._on_sync_type_change)
-        rb3.pack(side=tk.LEFT)
-        desc_label = ttk.Label(opt3, text="（符合下述条件的文件镜像，其他文件链接）",
-                            font=self._font(8), foreground="gray")
-        desc_label.pack(side=tk.LEFT, padx=(5, 0))
-        def on_opt3_click(event):
-            self.sync_type_var.set("mix")
-            self._on_sync_type_change()
-        opt3.bind('<Button-1>', on_opt3_click)
-        desc_label.bind('<Button-1>', on_opt3_click)
-        if last_st == "mix": self.sync_type_var.set("mix")
-
-        # 条件区域
-        self.filter_frame = ttk.Frame(type_fr, padding=(20, 5, 0, 0))
-
-        cond_row = ttk.Frame(self.filter_frame)
-        cond_row.pack(fill=tk.X, pady=2)
-
-        ttk.Label(cond_row, text="大小：", font=self._font(9)).pack(side=tk.LEFT)
-        self.size_min_var = tk.StringVar()
-        self.size_min_entry = ttk.Entry(cond_row, textvariable=self.size_min_var, font=self._font(9), width=6)
-        self.size_min_entry.pack(side=tk.LEFT, padx=(2, 2))
-        self._size_min_placeholder = "最小"
-        self._insert_placeholder(self.size_min_entry, self._size_min_placeholder)
-        self.size_min_entry.bind('<FocusIn>', lambda e: self._clear_placeholder(self.size_min_entry, self._size_min_placeholder))
-        self.size_min_entry.bind('<FocusOut>', lambda e: self._restore_placeholder(self.size_min_entry, self._size_min_placeholder))
-
-        ttk.Label(cond_row, text="—", font=self._font(9)).pack(side=tk.LEFT)
-
-        self.size_max_var = tk.StringVar()
-        self.size_max_entry = ttk.Entry(cond_row, textvariable=self.size_max_var, font=self._font(9), width=6)
-        self.size_max_entry.pack(side=tk.LEFT, padx=(2, 2))
-        self._size_max_placeholder = "最大"
-        self._insert_placeholder(self.size_max_entry, self._size_max_placeholder)
-        self.size_max_entry.bind('<FocusIn>', lambda e: self._clear_placeholder(self.size_max_entry, self._size_max_placeholder))
-        self.size_max_entry.bind('<FocusOut>', lambda e: self._restore_placeholder(self.size_max_entry, self._size_max_placeholder))
-
-        self.size_unit_var = tk.StringVar(value="KB")
-        unit_combo = ttk.Combobox(cond_row, textvariable=self.size_unit_var,
-                               values=["B", "KB", "MB", "GB"], state="readonly",
-                               font=self._font(9), width=4)
-        unit_combo.pack(side=tk.LEFT, padx=(2, 8))
-
-        self.logic_op_var = tk.StringVar(value="AND")
-        logic_combo = ttk.Combobox(cond_row, textvariable=self.logic_op_var,
-                                 values=["AND", "OR", "NOT"], state="readonly",
-                                 font=self._font(9), width=4)
-        logic_combo.pack(side=tk.LEFT, padx=(0, 8))
-
-        ttk.Label(cond_row, text="类型：", font=self._font(9)).pack(side=tk.LEFT)
-        self.ext_var = tk.StringVar()
-        self.ext_entry = ttk.Entry(cond_row, textvariable=self.ext_var, font=self._font(9), width=18)
-        self.ext_entry.pack(side=tk.LEFT, padx=(2, 8))
-        self._ext_placeholder = ".txt .doc 等"
-        self._insert_placeholder(self.ext_entry, self._ext_placeholder)
-        self.ext_entry.bind('<FocusIn>', lambda e: self._clear_placeholder(self.ext_entry, self._ext_placeholder))
-        self.ext_entry.bind('<FocusOut>', lambda e: self._restore_placeholder(self.ext_entry, self._ext_placeholder))
-
+        if last_st in ("symlink", "mirror", "mix"):
+            self.sync_type_var.set(last_st)
+        else:
+            self.sync_type_var.set("symlink")
+        
+        # 初始高亮 + 同步切换（让 mix 选中时正确隐藏示意图、显示过滤条件）
+        self._update_card_highlight()
         self._on_sync_type_change()
 
-        # 保存方案按钮
-        save_btn = ttk.Button(parent, text="保存方案", command=self._save_scheme, width=12)
-        save_btn.grid(row=2, column=0, sticky="w", pady=(6, 0))
+        # 按钮区域（在同步方式下方，同步进度上方）
+        btn_fr = ttk.Frame(parent)
+        btn_fr.grid(row=2, column=0, sticky="we", pady=(0, 6))
+
+        self.start_btn = ttk.Button(btn_fr, text="开始执行", command=self._start_sync, width=14)
+        self.start_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.cancel_btn = ttk.Button(btn_fr, text="取消", command=self._cancel_sync, state=tk.DISABLED, width=12)
+        self.cancel_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        save_btn = ttk.Button(btn_fr, text="保存方案", command=self._save_scheme, width=12)
+        save_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.clear_btn = ttk.Button(btn_fr, text="清空日志", command=self._clear_log, width=12)
+        self.clear_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        info_color = "green" if self.is_admin else "red"
+        info_text = "✓ 管理员权限已获取" if self.is_admin else "✗ 需要管理员权限"
+        ttk.Label(btn_fr, text=info_text, font=self._font(9, True), foreground=info_color).pack(side=tk.RIGHT)
 
         # 进度条
         prog_fr = ttk.LabelFrame(parent, text="同步进度", padding="8")
@@ -725,30 +756,13 @@ class FileMirrorApp:
         self.status_var = tk.StringVar(value="就绪 - 请选择源和目标文件夹")
         ttk.Label(prog_fr, textvariable=self.status_var, font=self._font(9)).pack(fill=tk.X)
 
-        # 按钮区域
-        btn_fr = ttk.Frame(parent)
-        btn_fr.grid(row=4, column=0, sticky="we", pady=(0, 6))
-
-        self.start_btn = ttk.Button(btn_fr, text="开始同步", command=self._start_sync, width=12)
-        self.start_btn.pack(side=tk.LEFT, padx=(0, 10))
-
-        self.cancel_btn = ttk.Button(btn_fr, text="取消", command=self._cancel_sync, state=tk.DISABLED, width=12)
-        self.cancel_btn.pack(side=tk.LEFT, padx=(0, 10))
-
-        self.clear_btn = ttk.Button(btn_fr, text="清空日志", command=self._clear_log, width=12)
-        self.clear_btn.pack(side=tk.LEFT)
-
-        info_color = "green" if self.is_admin else "red"
-        info_text = "✓ 管理员权限已获取" if self.is_admin else "✗ 需要管理员权限"
-        ttk.Label(btn_fr, text=info_text, font=self._font(9, True), foreground=info_color).pack(side=tk.RIGHT)
-
         # 日志区域
         log_fr = ttk.LabelFrame(parent, text="执行日志", padding="8")
         log_fr.grid(row=7, column=0, sticky="nswe")
         log_fr.columnconfigure(0, weight=1)
         log_fr.rowconfigure(0, weight=1)
 
-        self.log_text = tk.Text(log_fr, font=self._font_mono(), wrap=tk.WORD, state=tk.DISABLED, height=8)
+        self.log_text = tk.Text(log_fr, font=self._font(), wrap=tk.WORD, state=tk.DISABLED, height=8)
         sb = ttk.Scrollbar(log_fr, orient=tk.VERTICAL, command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=sb.set)
         self.log_text.grid(row=0, column=0, sticky="nswe")
@@ -773,29 +787,56 @@ class FileMirrorApp:
 
     # ── 方案列表相关 ───────────────────────────────────────────────────
 
+    def _migrate_old_schemes(self):
+        """兼容旧版：把分散在 config 目录下的独立方案 json 合并到 schemes.json"""
+        try:
+            d = SCHEME_FILE.parent
+            if not d.exists():
+                return
+            old_files = [f for f in d.glob("*.json")
+                         if f.name not in ("file_mirror_config.json",
+                                           "sync_progress.json",
+                                           "schemes.json")]
+            if not old_files:
+                return
+            existing = load_schemes()
+            seen = {s.get("name") for s in existing}
+            for f in old_files:
+                data = load_scheme_file(f)
+                if not data or "src" not in data:
+                    continue
+                if data.get("name") in seen:
+                    continue
+                data["id"] = uuid.uuid4().hex
+                data.setdefault("last_run_time", None)
+                existing.append(data)
+                seen.add(data.get("name"))
+            save_schemes(existing)
+            # 迁移完成后删除旧文件
+            for f in old_files:
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"迁移旧方案失败: {e}")
+
     def _refresh_scheme_list(self):
         self.scheme_tree.delete(*self.scheme_tree.get_children())
-        scheme_dir = get_scheme_dir()
-        if not scheme_dir.exists(): return
-        for fpath in sorted(scheme_dir.glob("*.json")):
-            # 跳过配置/进度等非方案文件
-            if fpath.name in ("file_mirror_config.json", "sync_progress.json"):
-                continue
-            data = load_scheme_file(fpath)
-            if not data: continue
-            name = data.get("name", fpath.stem)
-            last_run = data.get("last_run_time") or "-"
+        for s in sorted(load_schemes(), key=lambda x: x.get("name", "")):
+            sid = s.get("id", "")
+            name = s.get("name", sid)
+            last_run = s.get("last_run_time") or "-"
             if last_run and last_run != "-":
-                try: last_run = str(last_run)[:16]
+                try: last_run = str(last_run)[:10]   # 只显示日期 YYYY-MM-DD
                 except: pass
-            self.scheme_tree.insert("", tk.END, iid=str(fpath), values=(name, last_run))
+            self.scheme_tree.insert("", tk.END, iid=sid, values=(name, last_run))
 
     def _on_scheme_select(self, event=None):
-        # 仅当用户手动点击时更新 current_scheme_path
-        # 注意：_update_scheme_run_time 现在只更新单列，不触发此事件
+        # 仅当用户手动点击时更新 current_scheme_id
         sel = self._get_selected_scheme_path()
         if sel:
-            self.current_scheme_path = str(sel)
+            self.current_scheme_id = str(sel)
 
     def _get_selected_scheme_path(self):
         sel = self.scheme_tree.selection()
@@ -808,101 +849,92 @@ class FileMirrorApp:
             self.scheme_menu.tk_popup(event.x_root, event.y_root)
 
     def _load_scheme_from_list(self):
-        fpath = self._get_selected_scheme_path()
-        if not fpath:
+        sid = self._get_selected_scheme_path()
+        if not sid:
             messagebox.showwarning("提示", "请先选择一个方案")
             return
-        data = load_scheme_file(fpath)
+        data = find_scheme(sid)
         if not data:
-            messagebox.showerror("载入失败", f"无法读取方案文件：\n{fpath}")
+            messagebox.showerror("载入失败", "无法读取方案")
             return
-        self._apply_scheme_data(data, fpath)
+        self._apply_scheme_data(data, sid)
 
     def _run_scheme_from_list(self):
-        fpath = self._get_selected_scheme_path()
-        if not fpath:
+        sid = self._get_selected_scheme_path()
+        if not sid:
             messagebox.showwarning("提示", "请先选择一个方案")
             return
-        data = load_scheme_file(fpath)
+        data = find_scheme(sid)
         if not data:
-            messagebox.showerror("载入失败", f"无法读取方案文件：\n{fpath}")
+            messagebox.showerror("载入失败", "无法读取方案")
             return
-        self._apply_scheme_data(data, fpath)
-        self.current_scheme_path = str(fpath)  # 修复：记录当前方案路径，同步完成后才能更新执行时间
+        self._apply_scheme_data(data, sid)
+        self.current_scheme_id = sid  # 记录当前方案 id，同步完成后才能更新执行时间
         self._start_sync()
 
     def _delete_scheme(self):
-        fpath = self._get_selected_scheme_path()
-        if not fpath:
+        sid = self._get_selected_scheme_path()
+        if not sid:
             messagebox.showwarning("提示", "请先选择一个方案")
             return
-        name = Path(fpath).stem
+        schemes = load_schemes()
+        target = next((s for s in schemes if s.get("id") == sid), None)
+        if not target:
+            return
+        name = target.get("name", sid)
         if messagebox.askyesno("确认删除", f"确定要删除方案「{name}」吗？"):
-            try:
-                os.remove(fpath)
-                self._refresh_scheme_list()
-                messagebox.showinfo("删除成功", f"方案「{name}」已删除")
-            except Exception as e:
-                messagebox.showerror("删除失败", f"无法删除文件：\n{e}")
+            schemes = [s for s in schemes if s.get("id") != sid]
+            save_schemes(schemes)
+            if self.current_scheme_id == sid:
+                self.current_scheme_id = None
+            self._refresh_scheme_list()
+            messagebox.showinfo("删除成功", f"方案「{name}」已删除")
 
     def _rename_scheme(self):
         """重命名方案"""
-        fpath = self._get_selected_scheme_path()
-        if not fpath:
+        sid = self._get_selected_scheme_path()
+        if not sid:
             messagebox.showwarning("提示", "请先选择一个方案")
             return
-        
-        old_name = Path(fpath).stem
+        schemes = load_schemes()
+        target = next((s for s in schemes if s.get("id") == sid), None)
+        if not target:
+            return
+        old_name = target.get("name", sid)
         new_name = simpledialog.askstring("重命名方案", f"请输入新的方案名称：\n\n当前名称：{old_name}", initialvalue=old_name, parent=self.root)
-        
         if not new_name or new_name == old_name:
             return
-        
         safe_name = re.sub(r'[<>:"/\\|?*]', '_', new_name.strip())
         if not safe_name:
             messagebox.showerror("错误", "方案名称无效")
             return
-        
-        new_fpath = Path(fpath).parent / f"{safe_name}.json"
-        
-        if new_fpath.exists() and str(new_fpath) != fpath:
+        if any(s.get("name") == new_name and s.get("id") != sid for s in schemes):
             messagebox.showerror("错误", f"方案「{safe_name}」已存在")
             return
-        
         try:
-            # 重命名文件
-            os.rename(fpath, new_fpath)
-            
-            # 更新文件中的 name 字段
-            data = load_scheme_file(new_fpath)
-            if data:
-                data["name"] = new_name
-                with open(new_fpath, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-            
-            self.current_scheme_path = str(new_fpath)
+            target["name"] = new_name
+            save_schemes(schemes)
+            self.current_scheme_id = sid
             self._refresh_scheme_list()
-            self.scheme_tree.selection_set(str(new_fpath))
+            self.scheme_tree.selection_set(sid)
             messagebox.showinfo("重命名成功", f"方案已重命名为「{new_name}」")
         except Exception as e:
             messagebox.showerror("重命名失败", f"无法重命名方案：\n{e}")
 
     def _edit_scheme_runtime(self):
         """手动修改方案最后执行时间"""
-        fpath = self._get_selected_scheme_path()
-        if not fpath:
+        sid = self._get_selected_scheme_path()
+        if not sid:
             messagebox.showwarning("提示", "请先选择一个方案")
             return
-        
-        data = load_scheme_file(fpath)
-        if not data:
+        schemes = load_schemes()
+        target = next((s for s in schemes if s.get("id") == sid), None)
+        if not target:
             messagebox.showerror("错误", "无法读取方案文件")
             return
         
-        current_time = data.get("last_run_time") or time.strftime('%Y-%m-%d %H:%M:%S')
+        current_time = target.get("last_run_time") or time.strftime('%Y-%m-%d %H:%M:%S')
         
-        # 简单对话框：输入时间字符串（默认填当前时间）
-        from tkinter import simpledialog
         new_time = simpledialog.askstring(
             "修改执行时间", 
             "请输入最后执行时间：\n\n格式：YYYY-MM-DD HH:MM:SS\n留空则清除",
@@ -913,7 +945,6 @@ class FileMirrorApp:
         if new_time is None:  # 用户取消
             return
         
-        # 验证时间格式（简单验证）
         if new_time.strip():
             try:
                 time.strptime(new_time.strip(), '%Y-%m-%d %H:%M:%S')
@@ -921,17 +952,16 @@ class FileMirrorApp:
                 messagebox.showerror("错误", "时间格式不正确\n请使用：YYYY-MM-DD HH:MM:SS")
                 return
         
-        data["last_run_time"] = new_time.strip() or None
+        target["last_run_time"] = new_time.strip() or None
         try:
-            with open(fpath, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            save_schemes(schemes)
             self._refresh_scheme_list()
             messagebox.showinfo("修改成功", "方案执行时间已更新")
         except Exception as e:
             messagebox.showerror("修改失败", f"无法保存方案：\n{e}")
 
-    def _apply_scheme_data(self, data, fpath):
-        """应用方案数据到 UI"""
+    def _apply_scheme_data(self, data, sid):
+        """应用方案数据到 UI（sid 为方案唯一 id）"""
         self.src_var.set(data.get("src", "").replace('/', '\\'))
         self.dst_var.set(data.get("dst", "").replace('/', '\\'))
 
@@ -984,11 +1014,11 @@ class FileMirrorApp:
                     self.size_max_var.set(max_raw)
 
         self._on_sync_type_change()
-        self.current_scheme_path = str(fpath)
-        self._log(f"[INFO] 已载入方案：{data.get('name', Path(fpath).stem)}")
-        
-        # 修复：自动保存 current_scheme_path 到配置，确保同步完成后能更新时间
-        self.cfg["last_scheme_path"] = str(fpath)
+        self.current_scheme_id = str(sid)
+        self._log(f"[INFO] 已载入方案：{data.get('name', sid)}")
+
+        # 自动保存当前方案 id 到配置，确保同步完成后能更新时间
+        self.cfg["last_scheme_id"] = str(sid)
         save_config(self.cfg)
 
     # ── 规则收集 ─────────────────────────────────────────────────────
@@ -1031,13 +1061,144 @@ class FileMirrorApp:
 
     # ── 同步类型切换 ───────────────────────────────────────────────────
 
+    def _create_sync_card(self, parent, column, val, icon, title, desc, line_types):
+        """创建同步方式卡片（使用 Canvas 绘制图形）
+        line_types: 列表，每个元素是 'dashed' 或 'solid'，表示每条线的样式
+        """
+        # 使用 tk.Frame 实现边框效果
+        card = tk.Frame(parent, bg="white", highlightbackground="#cccccc", highlightthickness=1, padx=8, pady=8)
+        card.grid(row=0, column=column, padx=4, sticky="nsew")
+        
+        # 单选按钮 + 图标 + 标题（一行）
+        header_fr = tk.Frame(card, bg="white")
+        header_fr.pack(fill=tk.X)
+        
+        rb = tk.Radiobutton(header_fr, text="", value=val, variable=self.sync_type_var,
+                           command=self._on_sync_type_change, bg="white")
+        rb.pack(side=tk.LEFT)
+        
+        icon_lbl = tk.Label(header_fr, text=icon, font=self._font(14), bg="white")
+        icon_lbl.pack(side=tk.LEFT, padx=(2, 4))
+        
+        title_lbl = tk.Label(header_fr, text=title, font=self._font(13, True), bg="white")
+        title_lbl.pack(side=tk.LEFT)
+        
+        # 说明文字
+        desc_lbl = tk.Label(card, text=desc, font=self._font(9), fg="gray", bg="white", wraplength=220, justify="left")
+        desc_lbl.pack(anchor="w", pady=(4, 0))
+        
+        # 使用 Canvas 绘制示意图
+        canvas = tk.Canvas(card, width=220, height=80, bg="white", highlightthickness=0)
+        canvas.pack(anchor="w", pady=(8, 0))
+        
+        # 左右矩形（源、目）—— 加宽到 30px，文字移到矩形下方
+        # 左矩形（源）：x=18~48
+        canvas.create_rectangle(18, 12, 48, 52, outline="#0078d4", width=1.5, fill="#eaf4fc")
+        canvas.create_text(33, 66, text="源文件夹", font=self._font(9), fill="#0078d4")
+        
+        # 右矩形（目）：x=172~202
+        canvas.create_rectangle(172, 12, 202, 52, outline="#0078d4", width=1.5, fill="#eaf4fc")
+        canvas.create_text(187, 66, text="目标文件夹", font=self._font(9), fill="#0078d4")
+        
+        # 绘制三条线和箭头
+        y_positions = [20, 32, 44]  # 三条线的 y 坐标（均匀分布在矩形内）
+        for i, line_type in enumerate(line_types):
+            y = y_positions[i]
+            dash = (5, 3) if line_type == "dashed" else None
+            # 画线（从源矩形右边缘 48 到目矩形左边缘 172）
+            canvas.create_line(50, y, 162, y, fill="#333333", width=1.8, dash=dash)
+            # 画箭头（三角形，紧贴目矩形左边）
+            canvas.create_polygon(162, y-4, 162, y+4, 170, y, fill="#333333", outline="#333333")
+        
+        # Mix 卡片：保存 canvas 引用
+        if val == "mix":
+            self._mix_diagram_canvas = canvas
+        
+        # 点击整卡片均可选中
+        for w in (card, icon_lbl, title_lbl, desc_lbl, canvas):
+            w.bind('<Button-1>', lambda e, v=val: (self.sync_type_var.set(v), self._on_sync_type_change()))
+        
+        # Mix 卡片：添加过滤条件区域（初始隐藏）
+        if val == "mix":
+            filter_fr = tk.Frame(card, bg="white")
+            # 不立即 pack，由 _on_sync_type_change 控制显示
+            
+            # 文件大小行
+            size_row = tk.Frame(filter_fr, bg="white")
+            size_row.pack(fill=tk.X, pady=(6, 0))
+            tk.Label(size_row, text="文件大小：", font=self._font(9), bg="white").pack(side=tk.LEFT)
+            
+            self.size_min_var = tk.StringVar()
+            self.size_min_entry = tk.Entry(size_row, textvariable=self.size_min_var, font=self._font(9), width=6, relief="solid", bd=1)
+            self.size_min_entry.pack(side=tk.LEFT, padx=(2, 2))
+            self._size_min_placeholder = "最小"
+            self._insert_placeholder(self.size_min_entry, self._size_min_placeholder)
+            self.size_min_entry.bind('<FocusIn>', lambda e: self._clear_placeholder(self.size_min_entry, self._size_min_placeholder))
+            self.size_min_entry.bind('<FocusOut>', lambda e: self._restore_placeholder(self.size_min_entry, self._size_min_placeholder))
+            
+            tk.Label(size_row, text="—", font=self._font(9), bg="white").pack(side=tk.LEFT)
+            
+            self.size_max_var = tk.StringVar()
+            self.size_max_entry = tk.Entry(size_row, textvariable=self.size_max_var, font=self._font(9), width=6, relief="solid", bd=1)
+            self.size_max_entry.pack(side=tk.LEFT, padx=(2, 2))
+            self._size_max_placeholder = "最大"
+            self._insert_placeholder(self.size_max_entry, self._size_max_placeholder)
+            self.size_max_entry.bind('<FocusIn>', lambda e: self._clear_placeholder(self.size_max_entry, self._size_max_placeholder))
+            self.size_max_entry.bind('<FocusOut>', lambda e: self._restore_placeholder(self.size_max_entry, self._size_max_placeholder))
+            
+            self.size_unit_var = tk.StringVar(value="KB")
+            unit_combo = ttk.Combobox(size_row, textvariable=self.size_unit_var, values=["B", "KB", "MB", "GB"], 
+                                     state="readonly", font=self._font(9), width=4)
+            unit_combo.pack(side=tk.LEFT, padx=(2, 0))
+            
+            # 逻辑和类型行
+            logic_row = tk.Frame(filter_fr, bg="white")
+            logic_row.pack(fill=tk.X, pady=(4, 0))
+            
+            self.logic_op_var = tk.StringVar(value="AND")
+            logic_combo = ttk.Combobox(logic_row, textvariable=self.logic_op_var, values=["AND", "OR", "NOT"],
+                                      state="readonly", font=self._font(9), width=5)
+            logic_combo.pack(side=tk.LEFT)
+            
+            tk.Label(logic_row, text="  类型：", font=self._font(9), bg="white").pack(side=tk.LEFT)
+            
+            self.ext_var = tk.StringVar()
+            self.ext_entry = tk.Entry(logic_row, textvariable=self.ext_var, font=self._font(9), width=15, relief="solid", bd=1)
+            self.ext_entry.pack(side=tk.LEFT, padx=(2, 0))
+            self._ext_placeholder = ".txt .doc 等"
+            self._insert_placeholder(self.ext_entry, self._ext_placeholder)
+            self.ext_entry.bind('<FocusIn>', lambda e: self._clear_placeholder(self.ext_entry, self._ext_placeholder))
+            self.ext_entry.bind('<FocusOut>', lambda e: self._restore_placeholder(self.ext_entry, self._ext_placeholder))
+            
+            self.filter_frame = filter_fr  # 保存引用
+            self.filter_frame.pack_forget()  # 初始隐藏，由 _on_sync_type_change 控制
+        
+        return card
+
+    def _update_card_highlight(self):
+        """更新卡片选中状态的高亮边框"""
+        selected = self.sync_type_var.get()
+        for val, card in self._card_frames.items():
+            if val == selected:
+                card.config(highlightbackground="#0078d4", highlightthickness=2)  # 蓝色高亮
+            else:
+                card.config(highlightbackground="#cccccc", highlightthickness=1)  # 灰色边框
+
     def _on_sync_type_change(self):
         sync_type = self.sync_type_var.get()
+        # 更新卡片高亮
+        self._update_card_highlight()
+        # Mix 选中时：隐藏示意图，显示过滤条件；否则反之
         if sync_type == "mix":
-            try: self.filter_frame.pack(fill=tk.X, pady=(4, 0))
-            except Exception as e: print(f"[ERROR] pack failed: {e}")
+            if getattr(self, '_mix_diagram_canvas', None):
+                self._mix_diagram_canvas.pack_forget()
+            if getattr(self, 'filter_frame', None):
+                self.filter_frame.pack(fill=tk.X, pady=(6, 0))
         else:
-            self.filter_frame.pack_forget()
+            if getattr(self, 'filter_frame', None):
+                self.filter_frame.pack_forget()
+            if getattr(self, '_mix_diagram_canvas', None):
+                self._mix_diagram_canvas.pack(anchor="w", pady=(6, 0))
 
     # ── 文件浏览 ───────────────────────────────────────────────────────
 
@@ -1070,9 +1231,16 @@ class FileMirrorApp:
             messagebox.showerror("错误", "方案名称无效")
             return
 
-        filepath = get_scheme_dir() / f"{safe_name}.json"
+        schemes = load_schemes()
+        # 同名方案视为覆盖更新，否则新建
+        existing = next((s for s in schemes if s.get("name") == scheme_name), None)
+        if existing is None and any(s.get("name") == scheme_name for s in schemes):
+            if not messagebox.askyesno("确认覆盖", f"方案「{scheme_name}」已存在，是否覆盖？"):
+                return
 
-        if filepath.exists():
+        # 同名方案视为覆盖更新，否则新建
+        existing = next((s for s in schemes if s.get("name") == scheme_name), None)
+        if existing is not None:
             if not messagebox.askyesno("确认覆盖", f"方案「{scheme_name}」已存在，是否覆盖？"):
                 return
 
@@ -1089,13 +1257,26 @@ class FileMirrorApp:
             "last_run_time": None,
         }
 
+        if existing is not None:
+            scheme_data["id"] = existing.get("id") or uuid.uuid4().hex
+            scheme_data["created_time"] = existing.get("created_time", scheme_data["created_time"])
+            scheme_data["last_run_time"] = existing.get("last_run_time")
+            for i, s in enumerate(schemes):
+                if s.get("name") == scheme_name:
+                    schemes[i] = scheme_data
+                    break
+            new_id = scheme_data["id"]
+        else:
+            new_id = uuid.uuid4().hex
+            scheme_data["id"] = new_id
+            schemes.append(scheme_data)
+
         try:
-            with open(filepath, "w", encoding="utf-8") as f:
-                json.dump(scheme_data, f, ensure_ascii=False, indent=2)
-            self.current_scheme_path = str(filepath)
+            save_schemes(schemes)
+            self.current_scheme_id = new_id
             messagebox.showinfo("保存成功", f"方案「{scheme_name}」已保存")
             self._refresh_scheme_list()
-            self.scheme_tree.selection_set(str(filepath))
+            self.scheme_tree.selection_set(new_id)
         except Exception as e:
             messagebox.showerror("保存失败", f"无法写入文件：\n{e}")
 
@@ -1111,6 +1292,7 @@ class FileMirrorApp:
         self.log_text.configure(state=tk.NORMAL)
         self.log_text.delete(1.0, tk.END)
         self.log_text.configure(state=tk.DISABLED)
+        self._last_saved_log_idx = "1.0"
 
     def _update_progress(self, current, total, msg):
         pct = (current / total * 100) if total > 0 else 0
@@ -1120,47 +1302,38 @@ class FileMirrorApp:
     # ── 日志自动保存 ─────────────────────────────────────────────────
 
     def _save_log_to_file(self, scheme_name=None):
-        """保存当前日志到文件"""
+        """保存日志到单一文件（增量追加，避免重复）"""
         try:
-            LOG_DIR.mkdir(parents=True, exist_ok=True)
-            log_content = self.log_text.get(1.0, tk.END).strip()
+            start = getattr(self, "_last_saved_log_idx", "1.0")
+            log_content = self.log_text.get(start, tk.END).strip()
             if not log_content:
                 return
-            
-            timestamp = time.strftime('%Y%m%d_%H%M%S')
-            name_part = f"_{scheme_name}" if scheme_name else ""
-            log_file = LOG_DIR / f"sync_{timestamp}{name_part}.log"
-            
-            with open(log_file, "w", encoding="utf-8") as f:
-                f.write(log_content)
-            
-            # 只保留最近20个日志文件
-            logs = sorted(LOG_DIR.glob("sync_*.log"), key=lambda x: x.stat().st_mtime, reverse=True)
-            for old_log in logs[20:]:
-                try:
-                    old_log.unlink()
-                except Exception:
-                    pass
+            timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+            header = (f"\n{'='*60}\n[{timestamp}]"
+                      + (f" 方案：{scheme_name}" if scheme_name else "")
+                      + f"\n{'='*60}\n")
+            LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(header + log_content + "\n")
+            self._last_saved_log_idx = self.log_text.index(tk.END)
         except Exception as e:
             print(f"保存日志失败: {e}")
 
     def _load_last_log(self):
-        """加载最近一次的日志到日志区域"""
+        """加载历史日志文件内容到日志区域"""
         try:
-            if not LOG_DIR.exists():
+            if not LOG_FILE.exists():
                 return
-            logs = sorted(LOG_DIR.glob("sync_*.log"), key=lambda x: x.stat().st_mtime, reverse=True)
-            if not logs:
-                return
-            
-            last_log = logs[0]
-            with open(last_log, "r", encoding="utf-8") as f:
+            with open(LOG_FILE, "r", encoding="utf-8") as f:
                 content = f.read()
-            
+            if not content.strip():
+                return
             self.log_text.configure(state=tk.NORMAL)
-            self.log_text.insert(1.0, f"[INFO] 上次日志 ({last_log.name})：\n")
+            self.log_text.insert(1.0, f"[INFO] 上次日志（{LOG_FILE.name}）：\n")
             self.log_text.insert(tk.END, content + "\n")
             self.log_text.see(tk.END)
+            self.log_text.configure(state=tk.DISABLED)
+            self._last_saved_log_idx = self.log_text.index(tk.END)
             self.log_text.configure(state=tk.DISABLED)
         except Exception as e:
             print(f"加载上次日志失败: {e}")
@@ -1231,7 +1404,7 @@ class FileMirrorApp:
         self.cfg["sync_type"] = sync_type
         save_config(self.cfg)
 
-        # 修复：自动匹配方案（如果当前路径与某个方案匹配，自动设置 current_scheme_path）
+        # 自动匹配方案（如果当前 id 与某个方案匹配，自动设置 current_scheme_id）
         self._auto_match_scheme(src, dst)
 
         type_names = {"symlink": "符号链接", "mirror": "实际复制", "mix": "混合同步"}
@@ -1272,22 +1445,14 @@ class FileMirrorApp:
         t.start()
 
     def _auto_match_scheme(self, src, dst):
-        """自动匹配方案：仅在 current_scheme_path 为空时，如果当前路径与某个方案匹配，自动设置"""
-        if self.current_scheme_path:
+        """自动匹配方案：仅在 current_scheme_id 为空时，如果当前路径与某个方案匹配，自动设置"""
+        if self.current_scheme_id:
             return  # 已有明确选中的方案，不自动匹配
-        scheme_dir = get_scheme_dir()
-        if not scheme_dir.exists():
-            return
-        for fpath in scheme_dir.glob("*.json"):
-            if fpath.name in ("file_mirror_config.json", "sync_progress.json"):
-                continue
-            data = load_scheme_file(fpath)
-            if not data:
-                continue
-            if (data.get("src", "").replace('/', '\\') == src and 
+        for data in load_schemes():
+            if (data.get("src", "").replace('/', '\\') == src and
                 data.get("dst", "").replace('/', '\\') == dst):
-                self.current_scheme_path = str(fpath)
-                self._log(f"[INFO] 自动匹配到方案：{data.get('name', Path(fpath).stem)}")
+                self.current_scheme_id = data.get("id")
+                self._log(f"[INFO] 自动匹配到方案：{data.get('name', data.get('id', ''))}")
                 return
 
     def _run_sync(self):
@@ -1308,15 +1473,15 @@ class FileMirrorApp:
 
         # 保存日志到文件
         scheme_name = None
-        if self.current_scheme_path:
-            data = load_scheme_file(self.current_scheme_path)
+        if self.current_scheme_id:
+            data = find_scheme(self.current_scheme_id)
             if data:
                 scheme_name = data.get("name", "")
-        
+
         self._save_log_to_file(scheme_name)
 
-        if success and self.current_scheme_path:
-            self._update_scheme_run_time(self.current_scheme_path)
+        if success and self.current_scheme_id:
+            self._update_scheme_run_time(self.current_scheme_id)
 
         if error:
             messagebox.showerror("同步失败", error)
@@ -1325,36 +1490,32 @@ class FileMirrorApp:
         else:
             messagebox.showwarning("同步完成", "同步完成，但有错误发生，请查看日志")
 
-    def _update_scheme_run_time(self, fpath):
-        """更新方案最后执行时间 - 修复：增加异常处理和重试"""
+    def _update_scheme_run_time(self, scheme_id):
+        """更新方案最后执行时间（参数为方案 id）"""
         try:
-            data = load_scheme_file(fpath)
-            if data is None: 
-                self._log(f"[WARN] 无法读取方案文件：{fpath}")
+            schemes = load_schemes()
+            target = next((s for s in schemes if s.get("id") == scheme_id), None)
+            if not target:
+                self._log(f"[WARN] 无法找到方案：{scheme_id}")
                 return
             now_str = time.strftime('%Y-%m-%d %H:%M:%S')
-            data["last_run_time"] = now_str
-            # 增加重试机制
+            target["last_run_time"] = now_str
             for retry in range(3):
                 try:
-                    with open(fpath, "w", encoding="utf-8") as f:
-                        json.dump(data, f, ensure_ascii=False, indent=2)
+                    save_schemes(schemes)
                     break
                 except Exception as e:
                     if retry == 2:
                         self._log(f"[ERROR] 更新方案执行时间失败（已重试3次）：{e}")
-                    else:
-                        time.sleep(0.1)
-            # 只更新当前条目的 last_run 列，不整体刷新（避免触发 <<TreeviewSelect>> 覆盖 current_scheme_path）
+                        return
+                    time.sleep(0.1)
+            # 只更新当前条目在列表中的 last_run 列，不整体刷新（避免触发 <<TreeviewSelect>>）
             try:
-                fpath_str = str(fpath)
                 children = self.scheme_tree.get_children()
-                if fpath_str in children:
-                    name = data.get('name', Path(fpath).stem)
-                    last_run = now_str[:16]
-                    self.scheme_tree.item(fpath_str, values=(name, last_run))
-                # 不在列表中时不整体刷新，避免触发 <<TreeviewSelect>>
-                # 下次用户主动刷新或切换方案时会自动同步
+                if scheme_id in children:
+                    name = target.get('name', scheme_id)
+                    last_run = now_str[:10]   # 只显示日期 YYYY-MM-DD
+                    self.scheme_tree.item(scheme_id, values=(name, last_run))
             except Exception as e:
                 self._log(f"[WARN] 更新执行时间显示失败: {e}")
         except Exception as e:

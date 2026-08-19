@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 > nul
 echo ===================================
-echo FileMirrorTool v1.3 打包脚本
+echo FileMirrorTool v1.4 打包脚本
 echo ===================================
 
 REM 检查 Python 是否可用
